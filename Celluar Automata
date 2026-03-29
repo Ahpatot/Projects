@@ -1,0 +1,603 @@
+#include <SDL3/SDL.h>
+#include <iostream>
+#include <cstdlib>
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
+enum class PixelType {
+    None = 0,
+    Sand,
+    Water,
+    Fire,
+    Steam,
+    Wood,
+    Glass,
+    Stone,
+    Seed,
+    Plant,
+    Soil,
+    Lava,
+    Oil,
+    Metal
+};
+
+enum class State {
+    Solid,
+    Liquid,
+    Gas,
+    Static
+};
+
+struct Pixel {
+    bool alive = false;
+    bool fed = false;
+    PixelType type = PixelType::None;
+    int lifetime = 0;
+    int density = 0;
+    State state = State::Solid;
+    SDL_Color color = { 255, 0, 0, 255 };
+};
+
+void applyProperties(Pixel& p)
+{
+    switch (p.type)
+    {
+    case PixelType::Sand:   p.state = State::Solid;  p.density = 8; break;
+    case PixelType::Soil:   p.state = State::Solid;  p.density = 7; break;
+    case PixelType::Seed:   p.state = State::Solid;  p.density = 5; break;
+    case PixelType::Glass:  p.state = State::Solid;  p.density = 6; break;
+    case PixelType::Stone:  p.state = State::Solid;  p.density = 8; break;
+    case PixelType::Wood:   p.state = State::Static; p.density = 7; break;
+    case PixelType::Metal:  p.state = State::Static; p.density = 9; break;
+    case PixelType::Water:  p.state = State::Liquid; p.density = 3; break;
+    case PixelType::Lava:   p.state = State::Liquid; p.density = 4; break;
+    case PixelType::Oil:    p.state = State::Liquid; p.density = 2; break;
+    case PixelType::Fire:   p.state = State::Gas;    p.density = 0; break;
+    case PixelType::Steam:  p.state = State::Gas;    p.density = 0; break;
+    case PixelType::Plant:  p.state = State::Static; p.density = 2; break;
+    default: break;
+    }
+}
+
+std::string pixelTypeName(PixelType t)
+{
+    switch (t)
+    {
+    case PixelType::Sand:  return "Sand";
+    case PixelType::Water: return "Water";
+    case PixelType::Fire:  return "Fire";
+    case PixelType::Steam: return "Steam";
+    case PixelType::Wood:  return "Wood";
+    case PixelType::Glass: return "Glass";
+    case PixelType::Stone: return "Stone";
+    case PixelType::Seed:  return "Seed";
+    case PixelType::Plant: return "Plant";
+    case PixelType::Soil:  return "Soil";
+    case PixelType::Lava:  return "Lava";
+    case PixelType::Oil:   return "Oil";
+    case PixelType::Metal: return "Metal";
+    default:               return "Empty";
+    }
+}
+
+struct BrushEntry {
+    int brushId;
+    std::string name;
+    SDL_Color color;
+};
+
+void drawDigit(SDL_Renderer* r, int digit, int x, int y, int scale, SDL_Color c)
+{
+    static const int digits[10][5][3] = {
+        {{1,1,1},{1,0,1},{1,0,1},{1,0,1},{1,1,1}},
+        {{0,1,0},{1,1,0},{0,1,0},{0,1,0},{1,1,1}},
+        {{1,1,1},{0,0,1},{1,1,1},{1,0,0},{1,1,1}},
+        {{1,1,1},{0,0,1},{1,1,1},{0,0,1},{1,1,1}},
+        {{1,0,1},{1,0,1},{1,1,1},{0,0,1},{0,0,1}},
+        {{1,1,1},{1,0,0},{1,1,1},{0,0,1},{1,1,1}},
+        {{1,1,1},{1,0,0},{1,1,1},{1,0,1},{1,1,1}},
+        {{1,1,1},{0,0,1},{0,1,0},{0,1,0},{0,1,0}},
+        {{1,1,1},{1,0,1},{1,1,1},{1,0,1},{1,1,1}},
+        {{1,1,1},{1,0,1},{1,1,1},{0,0,1},{1,1,1}},
+    };
+    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
+    for (int row = 0; row < 5; row++)
+        for (int col = 0; col < 3; col++)
+            if (digits[digit][row][col])
+            {
+                SDL_FRect px = { (float)(x + col * scale), (float)(y + row * scale),
+                                 (float)scale, (float)scale };
+                SDL_RenderFillRect(r, &px);
+            }
+}
+
+void drawNumber(SDL_Renderer* r, int num, int x, int y, int scale, SDL_Color c)
+{
+    if (num >= 10) drawDigit(r, num / 10, x, y, scale, c);
+    drawDigit(r, num % 10, x + (num >= 10 ? 4 * scale : 0), y, scale, c);
+}
+
+int main()
+{
+    const int windowWidth = 1000;
+    const int windowHeight = 800;
+    const int pixelSize = 10;
+    const int panelWidth = 200;
+    const int panelHeight = 600;
+    const int swatchSize = 44;
+    const int swatchPad = 8;
+    const int cols2 = 2;
+
+    SDL_Window* simWindow = SDL_CreateWindow("SDL3 Falling Sand", windowWidth, windowHeight, 0);
+    SDL_Renderer* simRenderer = SDL_CreateRenderer(simWindow, NULL);
+    SDL_Window* panelWindow = SDL_CreateWindow("Brushes", panelWidth, panelHeight, 0);
+    SDL_Renderer* panelRenderer = SDL_CreateRenderer(panelWindow, NULL);
+
+    bool running = true;
+    SDL_Event event;
+    int brush = 1;
+    int brushSize = 1;
+    bool rightClickedThisFrame = false;
+    int frameCount = 0;
+
+    int cols = windowWidth / pixelSize;
+    int rows = windowHeight / pixelSize;
+
+    Pixel** pixels = new Pixel * [cols];
+    for (int i = 0; i < cols; i++)
+        pixels[i] = new Pixel[rows];
+
+    std::vector<BrushEntry> brushes = {
+        {  0, "Erase",  {  40,  40,  40, 255 } },
+        {  1, "Sand",   { 230, 190,  70, 255 } },
+        {  2, "Water",  {   0,  20, 220, 255 } },
+        {  3, "Fire",   { 255, 120,   0, 255 } },
+        {  4, "Wood",   { 110,  70,  30, 255 } },
+        {  5, "Stone",  { 140, 140, 140, 255 } },
+        {  6, "Soil",   {  90,  55,  25, 255 } },
+        {  7, "Seed",   { 120,  80,  25, 255 } },
+        {  8, "Lava",   { 230,  70,   0, 255 } },
+        {  9, "Oil",    {  40,  30,  10, 255 } },
+        { 10, "Metal",  { 165, 168, 172, 255 } },
+    };
+
+    SDL_WindowID simWinId = SDL_GetWindowID(simWindow);
+    SDL_WindowID panelWinId = SDL_GetWindowID(panelWindow);
+
+    while (running)
+    {
+        rightClickedThisFrame = false;
+        frameCount++;
+
+        while (SDL_PollEvent(&event))
+        {
+            if (event.type == SDL_EVENT_QUIT) running = false;
+            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = false;
+
+            if (event.type == SDL_EVENT_KEY_DOWN)
+            {
+                if (event.key.key == SDLK_0)  brush = 0;
+                if (event.key.key == SDLK_1)  brush = 1;
+                if (event.key.key == SDLK_2)  brush = 2;
+                if (event.key.key == SDLK_3)  brush = 3;
+                if (event.key.key == SDLK_4)  brush = 4;
+                if (event.key.key == SDLK_5)  brush = 5;
+                if (event.key.key == SDLK_6)  brush = 6;
+                if (event.key.key == SDLK_7)  brush = 7;
+                if (event.key.key == SDLK_8)  brush = 8;
+                if (event.key.key == SDLK_9)  brush = 9;
+            }
+
+            if (event.type == SDL_EVENT_MOUSE_WHEEL &&
+                event.wheel.windowID == simWinId)
+            {
+                brushSize += (int)event.wheel.y;
+                if (brushSize < 0)  brushSize = 0;
+                if (brushSize > 10) brushSize = 10;
+            }
+
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                event.button.windowID == panelWinId &&
+                event.button.button == SDL_BUTTON_LEFT)
+            {
+                int mx = (int)event.button.x;
+                int my = (int)event.button.y;
+                for (int b = 0; b < (int)brushes.size(); b++)
+                {
+                    int col = b % cols2;
+                    int row = b / cols2;
+                    int bx = swatchPad + col * (swatchSize + swatchPad);
+                    int by = swatchPad + row * (swatchSize + swatchPad);
+                    if (mx >= bx && mx <= bx + swatchSize &&
+                        my >= by && my <= by + swatchSize)
+                        brush = brushes[b].brushId;
+                }
+            }
+
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                event.button.windowID == simWinId &&
+                event.button.button == SDL_BUTTON_RIGHT)
+                rightClickedThisFrame = true;
+        }
+
+        float mx, my;
+        Uint32 mouseState = SDL_GetMouseState(&mx, &my);
+        SDL_WindowID focusedWin = SDL_GetWindowID(SDL_GetMouseFocus());
+
+        int gridX = (int)mx / pixelSize;
+        int gridY = (int)my / pixelSize;
+
+        if (focusedWin == simWinId &&
+            gridX >= 0 && gridX < cols && gridY >= 0 && gridY < rows)
+        {
+            std::string title = "Falling Sand | Hover: " +
+                pixelTypeName(pixels[gridX][gridY].type) +
+                " | Brush: " + brushes[brush < (int)brushes.size() ? brush : 0].name +
+                " | Size: " + std::to_string(brushSize);
+            SDL_SetWindowTitle(simWindow, title.c_str());
+        }
+
+        auto spawnPixel = [&](int px, int py)
+            {
+                if (px < 0 || px >= cols || py < 0 || py >= rows) return;
+                if (brush == 0) { pixels[px][py] = Pixel{}; return; }
+                if (pixels[px][py].alive) return;
+                Pixel np; np.alive = true;
+                if (brush == 1) { int s = rand() % 40; np.type = PixelType::Sand;  np.color = { (Uint8)(215 + s),(Uint8)(170 + s),(Uint8)(50 + s),255 }; }
+                else if (brush == 2) { np.type = PixelType::Water; np.color = { 0,20,220,255 }; }
+                else if (brush == 3) { np.type = PixelType::Fire;  np.lifetime = rand() % 20 + 20; np.color = { 255,120,0,255 }; }
+                else if (brush == 4) { int s = rand() % 30; np.type = PixelType::Wood;  np.color = { (Uint8)(100 + s),(Uint8)(60 + s),(Uint8)(20 + s),255 }; }
+                else if (brush == 5) { int s = rand() % 30; np.type = PixelType::Stone; np.color = { (Uint8)(120 + s),(Uint8)(120 + s),(Uint8)(120 + s),255 }; }
+                else if (brush == 6) { int s = rand() % 20; np.type = PixelType::Soil;  np.color = { (Uint8)(80 + s),(Uint8)(50 + s),(Uint8)(20 + s),255 }; }
+                else if (brush == 7) { np.type = PixelType::Seed;  np.color = { 120,80,25,255 }; }
+                else if (brush == 8) { np.type = PixelType::Lava;  int s = rand() % 40, v = rand() % 3; if (v == 0)np.color = { (Uint8)(220 + s / 4),(Uint8)(60 + s / 2),0,255 }; else if (v == 1)np.color = { (Uint8)(180 + s / 4),(Uint8)(30 + s / 2),0,255 }; else np.color = { (Uint8)(240 + s / 4),(Uint8)(100 + s / 2),0,255 }; }
+                else if (brush == 9) { np.type = PixelType::Oil;   int s = rand() % 20; np.color = { (Uint8)(30 + s),(Uint8)(25 + s),(Uint8)(5 + s),255 }; }
+                else if (brush == 10) { int s = rand() % 20, h = rand() % 3 == 0 ? 30 : 0; np.type = PixelType::Metal; np.color = { (Uint8)(150 + s + h),(Uint8)(155 + s + h),(Uint8)(160 + s + h),255 }; }
+                applyProperties(np);
+                pixels[px][py] = np;
+            };
+
+        if (focusedWin == simWinId)
+        {
+            if (mouseState & SDL_BUTTON_MASK(SDL_BUTTON_LEFT))
+                for (int bx = -brushSize;bx <= brushSize;bx++)
+                    for (int by = -brushSize;by <= brushSize;by++)
+                        spawnPixel(gridX + bx, gridY + by);
+            if (rightClickedThisFrame)
+                spawnPixel(gridX, gridY);
+        }
+
+        // ── Simulation bottom to top ──────────────────────────────────────
+        for (int j = rows - 1;j >= 0;j--) for (int i = 0;i < cols;i++)
+        {
+            Pixel& p = pixels[i][j];
+            if (!p.alive) continue;
+            if (p.state == State::Static) continue;
+            if (p.type == PixelType::Fire || p.type == PixelType::Steam) continue;
+
+            // passable: can this pixel move into tx,ty?
+            // for liquids: treats lower density liquids as empty (swap them)
+            // for solids: only moves into truly empty or lower density liquid
+            auto passable = [&](int tx, int ty) -> bool {
+                if (!pixels[tx][ty].alive) return true;
+                if (p.state == State::Liquid &&
+                    pixels[tx][ty].state == State::Liquid &&
+                    p.density > pixels[tx][ty].density) return true;
+                if (p.state == State::Solid &&
+                    pixels[tx][ty].state == State::Liquid &&
+                    p.density > pixels[tx][ty].density) return true;
+                return false;
+                };
+
+            // move p into tx,ty — displaced pixel comes back to p's spot
+            auto moveTo = [&](int tx, int ty) {
+                Pixel tmp = pixels[tx][ty];
+                pixels[tx][ty] = p;
+                p = tmp;
+                };
+
+            if (p.state == State::Solid)
+            {
+                if (j + 1 < rows && passable(i, j + 1))
+                {
+                    moveTo(i, j + 1);
+                }
+                else
+                {
+                    int dir = rand() % 2;
+                    int fa = dir == 0 ? i - 1 : i + 1;
+                    int fb = dir == 0 ? i + 1 : i - 1;
+                    if (fa >= 0 && fa < cols && j + 1 < rows && passable(fa, j + 1)) { moveTo(fa, j + 1); }
+                    else if (fb >= 0 && fb < cols && j + 1 < rows && passable(fb, j + 1)) { moveTo(fb, j + 1); }
+                }
+            }
+            else if (p.state == State::Liquid)
+            {
+                int left = (i - 1 + cols) % cols;
+                int right = (i + 1) % cols;
+
+                if (j + 1 < rows && passable(i, j + 1))
+                {
+                    moveTo(i, j + 1);
+                }
+                else
+                {
+                    // diagonal down
+                    int dir = rand() % 2;
+                    int first = dir == 0 ? left : right;
+                    int second = dir == 0 ? right : left;
+
+                    if (j + 1 < rows && passable(first, j + 1)) { moveTo(first, j + 1); }
+                    else if (j + 1 < rows && passable(second, j + 1)) { moveTo(second, j + 1); }
+                    else
+                    {
+                        // flat slide
+                        // check both sides — vibrate if both are free or both are lighter liquid
+                        bool leftFree = !pixels[left][j].alive || (pixels[left][j].state == State::Liquid && p.density > pixels[left][j].density);
+                        bool rightFree = !pixels[right][j].alive || (pixels[right][j].state == State::Liquid && p.density > pixels[right][j].density);
+
+                        // prefer side that leads to a drop
+                        bool leftDrop = j + 1 < rows && passable(left, j + 1);
+                        bool rightDrop = j + 1 < rows && passable(right, j + 1);
+
+                        int sd = rand() % 2;
+
+                        if (sd == 0 && leftDrop && leftFree) { moveTo(left, j); }
+                        else if (sd == 1 && rightDrop && rightFree) { moveTo(right, j); }
+                        else if (sd == 0 && rightDrop && rightFree) { moveTo(right, j); }
+                        else if (sd == 1 && leftDrop && leftFree) { moveTo(left, j); }
+                        // no drop — just vibrate freely left/right
+                        else if (sd == 0 && leftFree) { moveTo(left, j); }
+                        else if (sd == 1 && rightFree) { moveTo(right, j); }
+                        else if (sd == 0 && rightFree) { moveTo(right, j); }
+                        else if (sd == 1 && leftFree) { moveTo(left, j); }
+                    }
+                }
+            }
+
+            if (p.type == PixelType::Seed)
+            {
+                bool nw = false, ns = false; int wnx = -1, wny = -1;
+                int nb[4][2] = { {i,j - 1},{i,j + 1},{i - 1,j},{i + 1,j} };
+                for (auto& n : nb) { int nx = n[0], ny = n[1];if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) { if (pixels[nx][ny].type == PixelType::Water) { nw = true;wnx = nx;wny = ny; }if (pixels[nx][ny].type == PixelType::Soil)ns = true; } }
+                if (nw && ns) { pixels[wnx][wny] = Pixel{};p.type = PixelType::Plant;p.fed = false;applyProperties(p);int s = rand() % 30, gv = rand() % 3;if (gv == 0)p.color = { (Uint8)(20 + s / 4),(Uint8)(80 + s),(Uint8)(15 + s / 4),255 };else if (gv == 1)p.color = { (Uint8)(15 + s / 4),(Uint8)(100 + s),(Uint8)(20 + s / 4),255 };else p.color = { (Uint8)(30 + s / 4),(Uint8)(90 + s),(Uint8)(10 + s / 4),255 }; }
+            }
+        }
+
+        // plant pass 1
+        for (int j = rows - 1;j >= 0;j--) for (int i = 0;i < cols;i++)
+        {
+            if (!pixels[i][j].alive || pixels[i][j].type != PixelType::Plant) continue;
+            bool ns = false, nw = false; int wnx = -1, wny = -1;
+            int nb[4][2] = { {i,j - 1},{i,j + 1},{i - 1,j},{i + 1,j} };
+            for (auto& n : nb) { int nx = n[0], ny = n[1];if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) { if (pixels[nx][ny].type == PixelType::Soil)ns = true;if (pixels[nx][ny].type == PixelType::Water) { nw = true;wnx = nx;wny = ny; } } }
+            if (ns && nw) { pixels[i][j].fed = true;pixels[i][j].lifetime = wnx * 1000 + wny; }
+            else { pixels[i][j].fed = false;int ck[3][2] = { {i,j + 1},{i - 1,j},{i + 1,j} };for (auto& n : ck) { int nx = n[0], ny = n[1];if (nx >= 0 && nx < cols && ny >= 0 && ny < rows)if (pixels[nx][ny].type == PixelType::Plant && pixels[nx][ny].fed)pixels[i][j].fed = true; } }
+        }
+
+        // plant pass 2
+        for (int j = rows - 1;j >= 0;j--) for (int i = 0;i < cols;i++)
+        {
+            if (!pixels[i][j].alive || pixels[i][j].type != PixelType::Plant || !pixels[i][j].fed) continue;
+            if (j - 1 >= 0 && pixels[i][j - 1].alive && pixels[i][j - 1].type == PixelType::Plant) continue;
+            if (rand() % 500 < 2)
+            {
+                int dirs[3][2] = { {i,j - 1},{i - 1,j - 1},{i + 1,j - 1} };int pick = rand() % 3;int gx = dirs[pick][0], gy = dirs[pick][1];
+                if (gx >= 0 && gx < cols && gy >= 0 && gy < rows && !pixels[gx][gy].alive)
+                {
+                    bool wc = false;
+                    for (int rj = rows - 1;rj >= 0 && !wc;rj--) for (int ri = 0;ri < cols && !wc;ri++)
+                        if (pixels[ri][rj].type == PixelType::Plant && pixels[ri][rj].fed && pixels[ri][rj].lifetime > 0)
+                        {
+                            int wn[4][2] = { {ri,rj - 1},{ri,rj + 1},{ri - 1,rj},{ri + 1,rj} };for (auto& w : wn) { int wx = w[0], wy = w[1];if (wx >= 0 && wx < cols && wy >= 0 && wy < rows && pixels[wx][wy].type == PixelType::Water) { pixels[wx][wy] = Pixel{};wc = true;break; } }
+                        }
+                    if (wc) { pixels[gx][gy].alive = true;pixels[gx][gy].type = PixelType::Plant;pixels[gx][gy].fed = false;pixels[gx][gy].lifetime = 0;applyProperties(pixels[gx][gy]);int s = rand() % 30, gv = rand() % 3;if (gv == 0)pixels[gx][gy].color = { (Uint8)(20 + s / 4),(Uint8)(80 + s),(Uint8)(15 + s / 4),255 };else if (gv == 1)pixels[gx][gy].color = { (Uint8)(15 + s / 4),(Uint8)(100 + s),(Uint8)(20 + s / 4),255 };else pixels[gx][gy].color = { (Uint8)(30 + s / 4),(Uint8)(90 + s),(Uint8)(10 + s / 4),255 }; }
+                }
+            }
+        }
+
+        // ── Fire / steam / lava pass ──────────────────────────────────────
+        for (int j = 0;j < rows;j++) for (int i = 0;i < cols;i++)
+        {
+            Pixel& p = pixels[i][j];
+            if (!p.alive) continue;
+
+            if (p.type == PixelType::Fire)
+            {
+                p.lifetime--;
+                if (p.lifetime <= 0) { p = Pixel{};continue; }
+                int nb[4][2] = { {i,j - 1},{i,j + 1},{i - 1,j},{i + 1,j} };
+                bool hw = false;
+                for (auto& n : nb)
+                {
+                    int nx = n[0], ny = n[1];
+                    if (nx >= 0 && nx < cols && ny >= 0 && ny < rows)
+                    {
+                        if (pixels[nx][ny].type == PixelType::Water)
+                        {
+                            pixels[nx][ny].type = PixelType::Steam;
+                            pixels[nx][ny].lifetime = rand() % 100 + 100;
+                            pixels[nx][ny].color = { 200,200,200,255 };
+                            applyProperties(pixels[nx][ny]);
+                            hw = true;
+                        }
+                        else if (pixels[nx][ny].type == PixelType::Wood && rand() % 100 < 5)
+                        {
+                            pixels[nx][ny].type = PixelType::Fire;
+                            pixels[nx][ny].alive = true;
+                            pixels[nx][ny].lifetime = rand() % 20 + 20;
+                            pixels[nx][ny].color = { 255,120,0,255 };
+                            applyProperties(pixels[nx][ny]);
+                        }
+                        else if (pixels[nx][ny].type == PixelType::Sand && rand() % 1000 < 5)
+                        {
+                            pixels[nx][ny].type = PixelType::Glass;
+                            pixels[nx][ny].alive = true;
+                            int s = rand() % 15;
+                            pixels[nx][ny].color = { (Uint8)(180 + s),(Uint8)(220 + s),(Uint8)(225 + s),180 };
+                            applyProperties(pixels[nx][ny]);
+                        }
+                        else if (pixels[nx][ny].type == PixelType::Oil && rand() % 100 < 30)
+                        {
+                            pixels[nx][ny].type = PixelType::Fire;
+                            pixels[nx][ny].alive = true;
+                            pixels[nx][ny].lifetime = rand() % 40 + 40;
+                            pixels[nx][ny].color = { 255,120,0,255 };
+                            applyProperties(pixels[nx][ny]);
+                        }
+                    }
+                }
+                if (hw) { p = Pixel{};continue; }
+                if (j - 1 >= 0)
+                {
+                    int dir = rand() % 2;
+                    if (dir == 0 && i > 0 && !pixels[i - 1][j - 1].alive) { pixels[i - 1][j - 1] = p;p = Pixel{}; }
+                    else if (dir == 1 && i < cols - 1 && !pixels[i + 1][j - 1].alive) { pixels[i + 1][j - 1] = p;p = Pixel{}; }
+                    else if (!pixels[i][j - 1].alive) { pixels[i][j - 1] = p;p = Pixel{}; }
+                }
+                if (p.alive) { int f = rand() % 3;if (f == 0)p.color = { 200,50,0,255 };else if (f == 1)p.color = { 255,120,0,255 };else p.color = { 255,200,0,255 }; }
+            }
+            else if (p.type == PixelType::Steam)
+            {
+                p.lifetime--;
+                if (p.lifetime <= 0) { p = Pixel{};continue; }
+                if (j - 1 >= 0)
+                {
+                    int dir = rand() % 2;
+                    if (dir == 0 && i > 0 && !pixels[i - 1][j - 1].alive) { pixels[i - 1][j - 1] = p;p = Pixel{}; }
+                    else if (dir == 0 && i > 0 && pixels[i - 1][j - 1].type == PixelType::Water) { std::swap(pixels[i - 1][j - 1], p); }
+                    else if (dir == 1 && i < cols - 1 && !pixels[i + 1][j - 1].alive) { pixels[i + 1][j - 1] = p;p = Pixel{}; }
+                    else if (dir == 1 && i < cols - 1 && pixels[i + 1][j - 1].type == PixelType::Water) { std::swap(pixels[i + 1][j - 1], p); }
+                    else if (!pixels[i][j - 1].alive) { pixels[i][j - 1] = p;p = Pixel{}; }
+                    else if (pixels[i][j - 1].type == PixelType::Water) { std::swap(pixels[i][j - 1], p); }
+                }
+                if (p.alive) { int f = rand() % 3;if (f == 0)p.color = { 180,180,180,255 };else if (f == 1)p.color = { 200,200,200,255 };else p.color = { 220,220,220,255 }; }
+            }
+            else if (p.type == PixelType::Lava)
+            {
+                int nb[4][2] = { {i,j - 1},{i,j + 1},{i - 1,j},{i + 1,j} };
+                for (auto& n : nb)
+                {
+                    int nx = n[0], ny = n[1];
+                    if (nx >= 0 && nx < cols && ny >= 0 && ny < rows)
+                    {
+                        if (pixels[nx][ny].type == PixelType::Water)
+                        {
+                            pixels[nx][ny].type = PixelType::Steam;
+                            pixels[nx][ny].lifetime = rand() % 100 + 100;
+                            pixels[nx][ny].color = { 200,200,200,255 };
+                            applyProperties(pixels[nx][ny]);
+                            p.type = PixelType::Stone;
+                            int s = rand() % 30;
+                            p.color = { (Uint8)(120 + s),(Uint8)(120 + s),(Uint8)(120 + s),255 };
+                            applyProperties(p);
+                            break;
+                        }
+                        else if (pixels[nx][ny].type == PixelType::Wood && rand() % 100 < 8)
+                        {
+                            pixels[nx][ny].type = PixelType::Fire;
+                            pixels[nx][ny].alive = true;
+                            pixels[nx][ny].lifetime = rand() % 20 + 20;
+                            pixels[nx][ny].color = { 255,120,0,255 };
+                            applyProperties(pixels[nx][ny]);
+                        }
+                        else if (pixels[nx][ny].type == PixelType::Oil && rand() % 100 < 30)
+                        {
+                            pixels[nx][ny].type = PixelType::Fire;
+                            pixels[nx][ny].alive = true;
+                            pixels[nx][ny].lifetime = rand() % 40 + 40;
+                            pixels[nx][ny].color = { 255,120,0,255 };
+                            applyProperties(pixels[nx][ny]);
+                        }
+                    }
+                }
+                if (p.alive && p.type == PixelType::Lava)
+                {
+                    int f = rand() % 3;
+                    if (f == 0) p.color = { 210,50,0,255 };
+                    else if (f == 1) p.color = { 240,90,0,255 };
+                    else           p.color = { 255,140,0,255 };
+                }
+            }
+        }
+
+        // ── Water shimmer ─────────────────────────────────────────────────
+        for (int j = 0;j < rows;j++) for (int i = 0;i < cols;i++)
+            if (pixels[i][j].alive && pixels[i][j].type == PixelType::Water)
+            {
+                float w1 = sinf(i * 0.5f + frameCount * 0.05f), w2 = sinf(j * 0.8f + frameCount * 0.03f), c = (w1 + w2) * 0.5f;
+                pixels[i][j].color = { 0,(Uint8)std::max(15,std::min(35,(int)(20 + (c + 1) * 8))),(Uint8)std::max(200,std::min(240,(int)(220 + c * 20))),255 };
+            }
+
+        // ── Oil shimmer ───────────────────────────────────────────────────
+        for (int j = 0;j < rows;j++) for (int i = 0;i < cols;i++)
+            if (pixels[i][j].alive && pixels[i][j].type == PixelType::Oil)
+            {
+                float w1 = sinf(i * 0.7f + frameCount * 0.04f), w2 = sinf(j * 0.5f + frameCount * 0.02f), c = (w1 + w2) * 0.5f;
+                int r = std::max(25, std::min(55, (int)(38 + c * 12)));
+                int g = std::max(20, std::min(45, (int)(30 + c * 10)));
+                int b = std::max(5, std::min(25, (int)(12 + c * 8)));
+                pixels[i][j].color = { (Uint8)r,(Uint8)g,(Uint8)b,255 };
+            }
+
+        // ── Render sim ────────────────────────────────────────────────────
+        SDL_SetRenderDrawColor(simRenderer, 0, 0, 0, 255);
+        SDL_RenderClear(simRenderer);
+        for (int i = 0;i < cols;i++) for (int j = 0;j < rows;j++)
+            if (pixels[i][j].alive)
+            {
+                SDL_SetRenderDrawColor(simRenderer, pixels[i][j].color.r, pixels[i][j].color.g, pixels[i][j].color.b, 255);
+                SDL_FRect r = { (float)(i * pixelSize),(float)(j * pixelSize),(float)pixelSize,(float)pixelSize };
+                SDL_RenderFillRect(simRenderer, &r);
+            }
+        SDL_RenderPresent(simRenderer);
+
+        // ── Render panel ──────────────────────────────────────────────────
+        SDL_SetRenderDrawColor(panelRenderer, 20, 20, 20, 255);
+        SDL_RenderClear(panelRenderer);
+
+        for (int b = 0;b < (int)brushes.size();b++)
+        {
+            int col = b % cols2, row = b / cols2;
+            int bx = swatchPad + col * (swatchSize + swatchPad);
+            int by = swatchPad + row * (swatchSize + swatchPad);
+            bool selected = (brush == brushes[b].brushId);
+
+            SDL_SetRenderDrawColor(panelRenderer, selected ? 255 : 60, selected ? 255 : 60, selected ? 255 : 60, 255);
+            SDL_FRect border = { (float)(bx - 2),(float)(by - 2),(float)(swatchSize + 4),(float)(swatchSize + 4) };
+            SDL_RenderFillRect(panelRenderer, &border);
+
+            SDL_SetRenderDrawColor(panelRenderer, brushes[b].color.r, brushes[b].color.g, brushes[b].color.b, 255);
+            SDL_FRect swatch = { (float)bx,(float)by,(float)swatchSize,(float)swatchSize };
+            SDL_RenderFillRect(panelRenderer, &swatch);
+
+            SDL_Color white = { 255,255,255,255 };
+            drawNumber(panelRenderer, brushes[b].brushId, bx + 4, by + 4, 2, white);
+        }
+
+        SDL_SetRenderDrawColor(panelRenderer, 60, 60, 60, 255);
+        SDL_FRect sizeBar = { 8,(float)(panelHeight - 30),(float)(panelWidth - 16),22 };
+        SDL_RenderFillRect(panelRenderer, &sizeBar);
+        SDL_SetRenderDrawColor(panelRenderer, 180, 180, 255, 255);
+        SDL_FRect sizeFill = { 10,(float)(panelHeight - 28),(float)((panelWidth - 20) * brushSize / 10),18 };
+        SDL_RenderFillRect(panelRenderer, &sizeFill);
+        SDL_Color white = { 255,255,255,255 };
+        drawNumber(panelRenderer, brushSize, panelWidth / 2 - 8, panelHeight - 26, 3, white);
+
+        SDL_RenderPresent(panelRenderer);
+        SDL_Delay(16);
+    }
+
+    for (int i = 0;i < cols;i++) delete[] pixels[i];
+    delete[] pixels;
+
+    SDL_DestroyRenderer(simRenderer);
+    SDL_DestroyRenderer(panelRenderer);
+    SDL_DestroyWindow(simWindow);
+    SDL_DestroyWindow(panelWindow);
+    SDL_Quit();
+
+    return 0;
+}
